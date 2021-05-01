@@ -3,12 +3,12 @@ package main
 
 import (
 	"bufio"
+	csv2 "encoding/csv"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,7 +52,7 @@ var (
 )
 
 type batch struct {
-	rows []string
+	rows [][]string
 }
 
 // Parse args
@@ -114,18 +114,26 @@ func main() {
 		}
 	}
 
-	var scanner *bufio.Scanner
+	var csv *csv2.Reader
+	var file *os.File
 	if len(fromFile) > 0 {
-		file, err := os.Open(fromFile)
+		var err error
+		file, err = os.Open(fromFile)
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer file.Close()
 
-		scanner = bufio.NewScanner(file)
+		csv = csv2.NewReader(file)
 	} else {
-		scanner = bufio.NewScanner(os.Stdin)
+		csv = csv2.NewReader(os.Stdin)
 	}
+	csv.Comma = rune(splitCharacter[0])
+
+	defer func() {
+		if file != nil {
+			_ = file.Close()
+		}
+	}()
 
 	if headerLinesCnt <= 0 {
 		fmt.Printf("WARNING: provided --header-line-count (%d) must be greater than 0\n", headerLinesCnt)
@@ -135,8 +143,7 @@ func main() {
 	if tokenSize != 0 && tokenSize < bufio.MaxScanTokenSize {
 		fmt.Printf("WARNING: provided --token-size (%d) is smaller than default (%d), ignoring\n", tokenSize, bufio.MaxScanTokenSize)
 	} else if tokenSize > bufio.MaxScanTokenSize {
-		buf := make([]byte, tokenSize)
-		scanner.Buffer(buf, tokenSize)
+		_, _ = csv.Read()
 	}
 
 	var wg sync.WaitGroup
@@ -154,7 +161,7 @@ func main() {
 	}
 
 	start := time.Now()
-	rowsRead := scan(batchSize, scanner, batchChan)
+	rowsRead := scan(batchSize, csv, batchChan)
 	close(batchChan)
 	wg.Wait()
 	end := time.Now()
@@ -192,8 +199,8 @@ func report() {
 
 // scan reads lines from a bufio.Scanner, each which should be in CSV format
 // with a delimiter specified by --split (comma by default)
-func scan(itemsPerBatch int, scanner *bufio.Scanner, batchChan chan *batch) int64 {
-	rows := make([]string, 0, itemsPerBatch)
+func scan(itemsPerBatch int, scanner *csv2.Reader, batchChan chan *batch) int64 {
+	rows := make([][]string, 0, itemsPerBatch)
 	var linesRead int64
 
 	if skipHeader {
@@ -201,25 +208,27 @@ func scan(itemsPerBatch int, scanner *bufio.Scanner, batchChan chan *batch) int6
 			fmt.Printf("Skipping the first %d lines of the input.\n", headerLinesCnt)
 		}
 		for i := 0; i < headerLinesCnt; i++ {
-			scanner.Scan()
+			_, _ = scanner.Read()
 		}
 	}
 
-	for scanner.Scan() {
+	for {
 		if limit != 0 && linesRead >= limit {
 			break
 		}
 
-		rows = append(rows, scanner.Text())
+		row, err := scanner.Read()
+		if err != nil {
+			log.Fatalf("Error reading input: %s", err.Error())
+		}
+
+		linesRead++
+
+		rows = append(rows, row)
 		if len(rows) >= itemsPerBatch { // dispatch to COPY worker & reset
 			batchChan <- &batch{rows}
-			rows = make([]string, 0, itemsPerBatch)
+			rows = make([][]string, 0, itemsPerBatch)
 		}
-		linesRead++
-	}
-
-	if err := scanner.Err(); err != nil {
-		log.Fatalf("Error reading input: %s", err.Error())
 	}
 
 	// Finished reading input, make sure last batch goes out.
@@ -240,14 +249,6 @@ func processBatches(wg *sync.WaitGroup, c chan *batch) {
 	defer dbx.Close()
 
 	delimStr := "'" + splitCharacter + "'"
-	useSplitChar := splitCharacter
-	if splitCharacter == tabCharStr {
-		delimStr = "E" + delimStr
-		// Need to covert the string-ified version of the character to actual
-		// character for correct split
-		useSplitChar = "\t"
-	}
-
 	var copyCmd string
 	if columns != "" {
 		copyCmd = fmt.Sprintf("COPY %s(%s) FROM STDIN WITH DELIMITER %s %s", getFullTableName(), columns, delimStr, copyOptions)
@@ -257,7 +258,7 @@ func processBatches(wg *sync.WaitGroup, c chan *batch) {
 
 	for batch := range c {
 		start := time.Now()
-		rows, err := processBatch(dbx, batch, copyCmd, useSplitChar)
+		rows, err := processBatch(dbx, batch, copyCmd)
 		if err != nil {
 			panic(err)
 		}
@@ -271,7 +272,7 @@ func processBatches(wg *sync.WaitGroup, c chan *batch) {
 	wg.Done()
 }
 
-func processBatch(db *sqlx.DB, b *batch, copyCmd, splitChar string) (int64, error) {
+func processBatch(db *sqlx.DB, b *batch, copyCmd string) (int64, error) {
 	tx, err := db.Begin()
 	if err != nil {
 		return 0, err
@@ -283,17 +284,11 @@ func processBatch(db *sqlx.DB, b *batch, copyCmd, splitChar string) (int64, erro
 	}
 
 	for _, line := range b.rows {
-		// For some reason this is only needed for tab splitting
-		if splitChar == "\t" {
-			sp := strings.Split(line, splitChar)
-			args := make([]interface{}, len(sp))
-			for i, v := range sp {
-				args[i] = v
-			}
-			_, err = stmt.Exec(args...)
-		} else {
-			_, err = stmt.Exec(line)
+		args := make([]interface{}, len(line))
+		for i := range line {
+			args[i] = line[i]
 		}
+		_, err = stmt.Exec(args...)
 
 		if err != nil {
 			return 0, err
